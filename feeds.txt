@@ -1,0 +1,4 @@
+# One RSS or Atom feed URL per line. Lines starting with # are ignored.
+# Inline comments: text after the first # on a line is ignored (avoid # in URLs).
+
+https://theintercept.com/feed/

@@ -1,0 +1,10 @@
+# Local secrets (copy from .env.example)
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Optional cron log if you redirect here
+cron.log
