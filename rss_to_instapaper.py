@@ -33,7 +33,9 @@ import requests
 INSTAPAPER_ADD_URL = "https://www.instapaper.com/api/add"
 
 # Used only when no feeds.txt exists next to this script and no --feeds-file / --feed given.
-DEFAULT_FEED_URLS: tuple[str, ...] = ("https://theintercept.com/feed/",)
+DEFAULT_FEED_SPECS: tuple[tuple[str, int | None], ...] = (
+    ("https://theintercept.com/feed/", None),
+)
 
 
 def script_dir() -> Path:
@@ -129,72 +131,103 @@ def add_to_instapaper(
     return resp.status_code, text
 
 
-def load_feed_urls_from_file(path: Path) -> list[str]:
-    """One URL per line; # starts a comment to end of line; blank lines skipped."""
+def parse_feed_spec_line(line: str) -> tuple[str, int | None]:
+    """
+    One feed spec per line after comment stripping:
+      URL
+      URL <positive int>   → cap new items queued from this feed per run
+    """
+    parts = line.split()
+    if not parts:
+        raise ValueError("empty feed line")
+    if len(parts) >= 2 and parts[-1].isdigit():
+        cap = int(parts[-1], 10)
+        if cap < 1:
+            raise ValueError(f"per-feed limit must be >= 1, got {cap}")
+        url = " ".join(parts[:-1]).strip()
+        if not url:
+            raise ValueError("missing URL before per-feed limit")
+        return url, cap
+    return " ".join(parts).strip(), None
+
+
+def load_feed_specs_from_file(path: Path) -> list[tuple[str, int | None]]:
+    """One feed spec per line; # starts a comment to end of line; blank lines skipped."""
     text = path.read_text(encoding="utf-8")
-    urls: list[str] = []
-    for raw_line in text.splitlines():
+    specs: list[tuple[str, int | None]] = []
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
         if "#" in line:
             line = line.split("#", 1)[0].strip()
-        if line:
-            urls.append(line)
-    return urls
+        if not line:
+            continue
+        try:
+            url, cap = parse_feed_spec_line(line)
+        except ValueError as e:
+            raise ValueError(f"{path}:{lineno}: {e}") from e
+        if url:
+            specs.append((url, cap))
+    return specs
 
 
-def resolve_feed_urls(feeds_file: Path | None, extra_feeds: list[str] | None) -> tuple[list[str], str]:
-    """
-    Returns (urls, description of source for messages).
-    """
+def resolve_feed_specs(
+    feeds_file: Path | None,
+    extra_feeds: list[str] | None,
+) -> tuple[list[tuple[str, int | None]], str]:
+    """Returns (feed specs, description of source for messages)."""
     script_feeds_txt = script_dir() / "feeds.txt"
-    extras = list(extra_feeds or [])
+    extras_specs = [(u.strip(), None) for u in (extra_feeds or []) if u.strip()]
 
     if feeds_file is not None:
         path = feeds_file.expanduser().resolve()
         if not path.is_file():
             raise FileNotFoundError(str(path))
-        from_file = load_feed_urls_from_file(path)
+        from_file = load_feed_specs_from_file(path)
         if not from_file:
             raise ValueError(f"No feed URLs in file: {path}")
-        merged = _dedupe_preserve_order(from_file + extras)
+        merged = _dedupe_specs_preserve_order(from_file + extras_specs)
         return merged, str(path)
 
     if script_feeds_txt.is_file():
-        from_file = load_feed_urls_from_file(script_feeds_txt)
+        from_file = load_feed_specs_from_file(script_feeds_txt)
         if not from_file:
             raise ValueError(f"No feed URLs in file: {script_feeds_txt}")
-        merged = _dedupe_preserve_order(from_file + extras)
+        merged = _dedupe_specs_preserve_order(from_file + extras_specs)
         return merged, str(script_feeds_txt)
 
-    if extras:
-        return _dedupe_preserve_order(extras), "(--feed only)"
+    if extras_specs:
+        return _dedupe_specs_preserve_order(extras_specs), "(--feed only)"
 
-    return list(DEFAULT_FEED_URLS), "built-in default"
+    return list(DEFAULT_FEED_SPECS), "built-in default"
 
 
-def _dedupe_preserve_order(urls: list[str]) -> list[str]:
+def _dedupe_specs_preserve_order(specs: list[tuple[str, int | None]]) -> list[tuple[str, int | None]]:
     seen_u: set[str] = set()
-    out: list[str] = []
-    for u in urls:
-        u = u.strip()
+    out: list[tuple[str, int | None]] = []
+    for url, cap in specs:
+        u = url.strip()
         if not u or u in seen_u:
             continue
         seen_u.add(u)
-        out.append(u)
+        out.append((u, cap))
     return out
 
 
 def collect_new_items(
-    feed_urls: list[str],
+    feed_specs: list[tuple[str, int | None]],
     already_seen: set[str],
 ) -> list[tuple[str, str, str | None]]:
-    """Scan all feeds; return (fingerprint, article_url, title) not yet seen (deduped within this run)."""
+    """Scan all feeds; return (fingerprint, article_url, title) not yet seen (deduped within this run).
+
+    Each feed may enforce a per-run cap on *new* items appended from that feed (after fingerprint checks).
+    Global --limit is applied afterward in main().
+    """
     pending_fp: set[str] = set()
     to_send: list[tuple[str, str, str | None]] = []
 
-    for feed_url in feed_urls:
+    for feed_url, per_feed_cap in feed_specs:
         parsed = feedparser.parse(feed_url)
         if getattr(parsed, "bozo", False) and not parsed.entries:
             print(
@@ -206,7 +239,10 @@ def collect_new_items(
         entries = list(parsed.entries or [])
         entries.reverse()
 
+        queued_this_feed = 0
         for entry in entries:
+            if per_feed_cap is not None and queued_this_feed >= per_feed_cap:
+                break
             fp = item_fingerprint(entry)
             url = item_url(entry)
             if not fp or not url:
@@ -215,6 +251,7 @@ def collect_new_items(
                 continue
             pending_fp.add(fp)
             to_send.append((fp, url, item_title(entry)))
+            queued_this_feed += 1
 
     return to_send
 
@@ -225,7 +262,8 @@ def parse_args() -> argparse.Namespace:
         "--feeds-file",
         type=Path,
         default=None,
-        help="Text file with one feed URL per line (# comments allowed). "
+        help="Feeds file: one URL per line, optional trailing per-run cap: \"URL\" or \"URL N\" "
+        "(N = max new items from that feed per run). # comments allowed. "
         f"If omitted, uses {script_dir() / 'feeds.txt'} when that file exists, else built-in defaults.",
     )
     p.add_argument(
@@ -253,7 +291,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         dest="max_add",
         metavar="N",
-        help="Add at most N new articles this run (0 = no limit; same as --limit)",
+        help="After per-feed caps: add at most N new articles this run in total (0 = no cap; same as --limit)",
     )
     p.add_argument(
         "--sleep-seconds",
@@ -277,7 +315,7 @@ def main() -> int:
         return 2
 
     try:
-        feed_urls, source_label = resolve_feed_urls(args.feeds_file, args.extra_feeds)
+        feed_specs, source_label = resolve_feed_specs(args.feeds_file, args.extra_feeds)
     except FileNotFoundError as e:
         print(str(e), file=sys.stderr)
         return 2
@@ -285,9 +323,9 @@ def main() -> int:
         print(str(e), file=sys.stderr)
         return 2
 
-    print(f"Feeds ({len(feed_urls)}): from {source_label}")
+    print(f"Feeds ({len(feed_specs)}): from {source_label}")
 
-    to_send = collect_new_items(feed_urls, seen)
+    to_send = collect_new_items(feed_specs, seen)
 
     if args.max_add > 0:
         to_send = to_send[: args.max_add]

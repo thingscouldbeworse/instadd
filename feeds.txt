@@ -1,4 +1,12 @@
 # One RSS or Atom feed URL per line. Lines starting with # are ignored.
 # Inline comments: text after the first # on a line is ignored (avoid # in URLs).
+#
+# Optional per-feed cap (per run): append a positive integer after the URL.
+# Only that many *new* items (not already in seen.json) are queued from that feed each run.
+#
+# Examples:
+#   https://example.com/feed/
+#   https://example.com/other/feed/ 5
 
-https://theintercept.com/feed/
+https://theintercept.com/feed/ 20
+https://exple.tive.org/blarg/feed/ 10

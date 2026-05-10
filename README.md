@@ -30,23 +30,34 @@ Or:
 Flags that matter:
 
 
-| Flag                        | Purpose                                                             |
-| --------------------------- | ------------------------------------------------------------------- |
-| `--limit N` / `--max-add N` | Add at most N new articles this run (0 = no cap)                    |
-| `--feeds-file PATH`         | Use that file instead of the default `feeds.txt` next to the script |
-| `--feed URL`                | Extra feed URL (repeatable); merged after the feeds file            |
-| `--state-file PATH`         | Store fingerprints here instead of the default under `$HOME`        |
-| `--dry-run`                 | Parse feeds only; no Instapaper, no state updates                   |
+| Flag                        | Purpose                                                                      |
+| --------------------------- | ---------------------------------------------------------------------------- |
+| `--limit N` / `--max-add N` | After per-feed caps: add at most **N** items **total** this run (0 = no cap) |
+| `--feeds-file PATH`         | Use that file instead of the default `feeds.txt` next to the script          |
+| `--feed URL`                | Extra feed URL (repeatable); merged after the feeds file                     |
+| `--state-file PATH`         | Store fingerprints here instead of the default under `$HOME`                 |
+| `--dry-run`                 | Parse feeds only; no Instapaper, no state updates                            |
 
 
 ## Feeds
 
 Default behavior:
 
-1. If `feeds.txt` exists next to `rss_to_instapaper.py`, read it (one URL per line; `#` starts a comment; blank lines ignored).
+1. If `feeds.txt` exists next to `rss_to_instapaper.py`, read it (see format below).
 2. Else use a small built-in default list.
 
-To add a feed: append its RSS or Atom URL as a new line in `feeds.txt`, or pass `--feed https://...` once or multiple times, or point `--feeds-file` at another list.
+`**feeds.txt` format:** one feed per line.
+
+- `https://example.com/feed/` — no per-feed cap for that source.
+- `https://example.com/feed/ 5` — queue at most **5 new** items from that feed **per run** (fingerprints already in `seen.json` do not count toward the 5). Omit the number for no cap on that feed.
+
+`#` starts a comment (whole-line or after whitespace); blank lines are ignored.
+
+Order is preserved. Duplicate URLs: first line wins (including its cap).
+
+`**--feed URL`** extras have **no** per-feed cap (same as an uncapped line). They are merged after the file; duplicate URLs are dropped.
+
+**Limits stack:** each feed’s optional cap runs first; then `**--limit` / `--max-add`** trims the **combined** queue for that run. Example: two feeds capped at 5 each could produce up to 10 candidates; `--limit 7` would send at most seven overall.
 
 ## State (what was already sent)
 
@@ -82,8 +93,6 @@ On many Debian/Ubuntu systems you can also:
 ```bash
 sudo grep CRON /var/log/syslog | tail
 ```
-
-Look for a line like `(kirk) CMD (...run-cron.sh...)`. Messages such as “No MTA installed, discarding output” refer to jobs whose output was not redirected to a file and could not be mailed; they are not about `cron.log` itself.
 
 ## Requirements
 
