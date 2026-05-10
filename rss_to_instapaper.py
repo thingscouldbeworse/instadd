@@ -10,8 +10,10 @@ Usage:
   python rss_to_instapaper.py   # uses feeds.txt next to this script if present, else built-in default
   python rss_to_instapaper.py --feeds-file /path/to/feeds.txt
   python rss_to_instapaper.py --feed https://example.com/atom.xml  # extra feed (repeat flag for more)
-  python rss_to_instapaper.py --limit 5   # add at most 5 new articles (--max-add is the same flag)
+  python rss_to_instapaper.py --limit 5   # N: per-run Instapaper cap (global this run)
   python rss_to_instapaper.py --dry-run  # parse feeds only, no Instapaper calls
+
+feeds.txt optional trailing M: only consider the first M entries from that feed XML (usually M newest).
 
 Cron: use run-cron.sh (sources .env next to the script) so PATH and credentials work.
   crontab -e → 0 2 * * * /full/path/to/instadd/run-cron.sh >> /full/path/to/instadd/cron.log 2>&1
@@ -135,19 +137,22 @@ def parse_feed_spec_line(line: str) -> tuple[str, int | None]:
     """
     One feed spec per line after comment stripping:
       URL
-      URL <positive int>   → cap new items queued from this feed per run
+      URL <positive int M>   → only consider the first M entries from the fetched feed
+        (feedparser order is usually newest-first, so this is the M newest items in the XML).
+        Items beyond that window are ignored, including across future runs, until they re-enter
+        the window. Omit M to consider the full entry list returned by the feed.
     """
     parts = line.split()
     if not parts:
         raise ValueError("empty feed line")
     if len(parts) >= 2 and parts[-1].isdigit():
-        cap = int(parts[-1], 10)
-        if cap < 1:
-            raise ValueError(f"per-feed limit must be >= 1, got {cap}")
+        depth = int(parts[-1], 10)
+        if depth < 1:
+            raise ValueError(f"feed depth M must be >= 1, got {depth}")
         url = " ".join(parts[:-1]).strip()
         if not url:
-            raise ValueError("missing URL before per-feed limit")
-        return url, cap
+            raise ValueError("missing URL before feed depth M")
+        return url, depth
     return " ".join(parts).strip(), None
 
 
@@ -221,13 +226,13 @@ def collect_new_items(
 ) -> list[tuple[str, str, str | None]]:
     """Scan all feeds; return (fingerprint, article_url, title) not yet seen (deduped within this run).
 
-    Each feed may enforce a per-run cap on *new* items appended from that feed (after fingerprint checks).
-    Global --limit is applied afterward in main().
+    Optional M per feed: only the first M entries from the parsed feed document are considered
+    (typically the M newest posts). Global per-run cap N is ``--limit`` / ``--max-add`` in main().
     """
     pending_fp: set[str] = set()
     to_send: list[tuple[str, str, str | None]] = []
 
-    for feed_url, per_feed_cap in feed_specs:
+    for feed_url, entry_depth_m in feed_specs:
         parsed = feedparser.parse(feed_url)
         if getattr(parsed, "bozo", False) and not parsed.entries:
             print(
@@ -237,12 +242,11 @@ def collect_new_items(
             )
 
         entries = list(parsed.entries or [])
+        if entry_depth_m is not None:
+            entries = entries[:entry_depth_m]
         entries.reverse()
 
-        queued_this_feed = 0
         for entry in entries:
-            if per_feed_cap is not None and queued_this_feed >= per_feed_cap:
-                break
             fp = item_fingerprint(entry)
             url = item_url(entry)
             if not fp or not url:
@@ -251,7 +255,6 @@ def collect_new_items(
                 continue
             pending_fp.add(fp)
             to_send.append((fp, url, item_title(entry)))
-            queued_this_feed += 1
 
     return to_send
 
@@ -262,8 +265,9 @@ def parse_args() -> argparse.Namespace:
         "--feeds-file",
         type=Path,
         default=None,
-        help="Feeds file: one URL per line, optional trailing per-run cap: \"URL\" or \"URL N\" "
-        "(N = max new items from that feed per run). # comments allowed. "
+        help="Feeds file: one URL per line, optional trailing depth M: \"URL\" or \"URL M\". "
+        "M = only consider the first M entries from that feed's XML (usually the M newest). "
+        "# comments allowed. "
         f"If omitted, uses {script_dir() / 'feeds.txt'} when that file exists, else built-in defaults.",
     )
     p.add_argument(
@@ -291,7 +295,8 @@ def parse_args() -> argparse.Namespace:
         default=0,
         dest="max_add",
         metavar="N",
-        help="After per-feed caps: add at most N new articles this run in total (0 = no cap; same as --limit)",
+        help="Per-run cap N: add at most N new articles this run in total across all feeds (0 = no cap; same as --limit). "
+        "Applied after each feed's optional depth M window.",
     )
     p.add_argument(
         "--sleep-seconds",

@@ -32,7 +32,8 @@ Flags that matter:
 
 | Flag                        | Purpose                                                                      |
 | --------------------------- | ---------------------------------------------------------------------------- |
-| `--limit N` / `--max-add N` | After per-feed caps: add at most **N** items **total** this run (0 = no cap) |
+| `--limit N` / `--max-add N` | **Per-run cap N:** at most **N** Instapaper adds **this run** in total (0 = no cap) |
+
 | `--feeds-file PATH`         | Use that file instead of the default `feeds.txt` next to the script          |
 | `--feed URL`                | Extra feed URL (repeatable); merged after the feeds file                     |
 | `--state-file PATH`         | Store fingerprints here instead of the default under `$HOME`                 |
@@ -48,16 +49,16 @@ Default behavior:
 
 `**feeds.txt` format:** one feed per line.
 
-- `https://example.com/feed/` — no per-feed cap for that source.
-- `https://example.com/feed/ 5` — queue at most **5 new** items from that feed **per run** (fingerprints already in `seen.json` do not count toward the 5). Omit the number for no cap on that feed.
+- `https://example.com/feed/` — consider every entry the feed returns (no depth cap).
+- `https://example.com/feed/ 25` — optional **M = 25:** only look at the **first 25 entries** in that feed’s parsed document. In typical RSS/Atom ordering that is the **25 newest** items in the XML. Anything older in the file is ignored (including on later runs) unless it moves back into that top **M** window when the feed updates.
 
 `#` starts a comment (whole-line or after whitespace); blank lines are ignored.
 
-Order is preserved. Duplicate URLs: first line wins (including its cap).
+Order is preserved. Duplicate URLs: first line wins (including its **M**).
 
-`**--feed URL`** extras have **no** per-feed cap (same as an uncapped line). They are merged after the file; duplicate URLs are dropped.
+`**--feed URL`** extras have **no** depth **M** (full entry list). They are merged after the file; duplicate URLs are dropped.
 
-**Limits stack:** each feed’s optional cap runs first; then `**--limit` / `--max-add`** trims the **combined** queue for that run. Example: two feeds capped at 5 each could produce up to 10 candidates; `--limit 7` would send at most seven overall.
+**N vs M:** **M** (optional suffix in `feeds.txt`) limits how deep you read each feed’s history. **N** is `--limit` / `--max-add`: max adds to Instapaper **this run** after building the combined queue from all feeds. Example: two feeds each with depth **M** = 20 could still yield many unseen items; `--limit 15` sends at most 15 total tonight.
 
 ## State (what was already sent)
 
