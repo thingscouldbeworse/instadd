@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
-Poll an RSS/Atom feed and add new item URLs to Instapaper (Simple API).
+Poll an RSS/Atom feed and add new item URLs to Instapaper (Simple API),
+and optionally prune stale unread bookmarks via Instapaper Full API (OAuth 1.0a).
 
 Environment:
-  INSTAPAPER_USERNAME  Instapaper email or username (required unless --dry-run)
-  INSTAPAPER_PASSWORD  Password if the account has one; omit or empty if none
+  INSTAPAPER_USERNAME     Instapaper email or username (required unless --dry-run)
+  INSTAPAPER_PASSWORD     Password if the account has one; omit or empty if none
+  CONSUMER_KEY            Instapaper OAuth Consumer Key (required for staleness pruning)
+  CONSUMER_SECRET         Instapaper OAuth Consumer Secret (required for staleness pruning)
 
 Usage:
   python rss_to_instapaper.py   # uses feeds.txt next to this script if present, else built-in default
   python rss_to_instapaper.py --feeds-file /path/to/feeds.txt
   python rss_to_instapaper.py --feed https://example.com/atom.xml  # extra feed (repeat flag for more)
   python rss_to_instapaper.py --limit 5   # N: per-run Instapaper cap (global this run)
-  python rss_to_instapaper.py --dry-run  # parse feeds only, no Instapaper calls
+  python rss_to_instapaper.py --dry-run  # parse feeds only, no Instapaper mutations
+  python rss_to_instapaper.py --skip-prune # skip pruning step
 
-feeds.txt optional trailing M: only consider the first M entries from that feed XML (usually M newest).
+feeds.txt format:
+  URL [M] [staleness_days]
+  - M: only consider first M entries from XML (usually M newest).
+  - staleness_days: prune articles from this source older than this many days.
 
 Cron: use run-cron.sh (sources .env next to the script) so PATH and credentials work.
   crontab -e → 0 2 * * * /full/path/to/instadd/run-cron.sh >> /full/path/to/instadd/cron.log 2>&1
@@ -27,16 +34,28 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+from urllib.parse import parse_qs, urlparse
 
 import feedparser
 import requests
+from requests_oauthlib import OAuth1
 
 INSTAPAPER_ADD_URL = "https://www.instapaper.com/api/add"
+INSTAPAPER_OAUTH_TOKEN_URL = "https://www.instapaper.com/api/1/oauth/access_token"
+INSTAPAPER_BOOKMARKS_LIST_URL = "https://www.instapaper.com/api/1/bookmarks/list"
+INSTAPAPER_BOOKMARKS_DELETE_URL = "https://www.instapaper.com/api/1/bookmarks/delete"
+
+
+class FeedSpec(NamedTuple):
+    url: str
+    depth_m: int | None = None
+    max_age_days: int | None = None
+
 
 # Used only when no feeds.txt exists next to this script and no --feeds-file / --feed given.
-DEFAULT_FEED_SPECS: tuple[tuple[str, int | None], ...] = (
-    ("https://theintercept.com/feed/", None),
+DEFAULT_FEED_SPECS: tuple[FeedSpec, ...] = (
+    FeedSpec("https://theintercept.com/feed/", None, None),
 )
 
 
@@ -112,6 +131,37 @@ def item_title(entry: Any) -> str | None:
     return s or None
 
 
+def normalize_domain(url: str) -> str:
+    parsed = urlparse(url)
+    domain = (parsed.netloc or "").lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    return domain
+
+
+def bookmark_matches_feed(bookmark_url: str, feed_url: str) -> bool:
+    """Check whether a bookmark URL belongs to the source of feed_url."""
+    b_domain = normalize_domain(bookmark_url)
+    f_domain = normalize_domain(feed_url)
+    if not b_domain or not f_domain:
+        return False
+    if b_domain != f_domain:
+        return False
+
+    # Check path prefix if the feed URL is not root-level
+    f_path = urlparse(feed_url).path.rstrip("/")
+    for suffix in ("/feed", "/rss", "/atom.xml", "/feed.xml", "/index.xml", "/rss.xml"):
+        if f_path.endswith(suffix):
+            f_path = f_path[: -len(suffix)].rstrip("/")
+            break
+    if f_path and f_path != "":
+        b_path = urlparse(bookmark_url).path
+        if not b_path.startswith(f_path):
+            return False
+
+    return True
+
+
 def add_to_instapaper(
     session: requests.Session,
     username: str,
@@ -133,18 +183,186 @@ def add_to_instapaper(
     return resp.status_code, text
 
 
-def parse_feed_spec_line(line: str) -> tuple[str, int | None]:
+def get_instapaper_oauth_session(
+    username: str,
+    password: str,
+    consumer_key: str,
+    consumer_secret: str,
+    timeout: float = 60.0,
+) -> requests.Session:
+    """Authenticate with Instapaper Full API via xAuth and return an authenticated requests.Session."""
+    auth = OAuth1(client_key=consumer_key, client_secret=consumer_secret)
+    payload = {
+        "x_auth_username": username,
+        "x_auth_password": password,
+        "x_auth_mode": "client_auth",
+    }
+    resp = requests.post(INSTAPAPER_OAUTH_TOKEN_URL, auth=auth, data=payload, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Instapaper OAuth failed ({resp.status_code}): {resp.text.strip()[:300]}"
+        )
+    tokens = parse_qs(resp.text)
+    if "oauth_token" not in tokens or "oauth_token_secret" not in tokens:
+        raise RuntimeError(f"Unexpected OAuth response from Instapaper: {resp.text.strip()[:300]}")
+
+    oauth_token = tokens["oauth_token"][0]
+    oauth_token_secret = tokens["oauth_token_secret"][0]
+
+    user_auth = OAuth1(
+        client_key=consumer_key,
+        client_secret=consumer_secret,
+        resource_owner_key=oauth_token,
+        resource_owner_secret=oauth_token_secret,
+    )
+    session = requests.Session()
+    session.auth = user_auth
+    return session
+
+
+def fetch_bookmarks(session: requests.Session, limit: int = 500) -> list[dict[str, Any]]:
+    """Fetch unread bookmarks from Instapaper Full API."""
+    resp = session.post(INSTAPAPER_BOOKMARKS_LIST_URL, data={"limit": limit}, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Failed to fetch bookmarks ({resp.status_code}): {resp.text.strip()[:300]}"
+        )
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"Invalid JSON from Instapaper bookmarks list: {e}") from e
+
+    bookmarks: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and item.get("type") == "bookmark":
+                bookmarks.append(item)
+    elif isinstance(data, dict):
+        for item in data.get("bookmarks", []):
+            if isinstance(item, dict):
+                bookmarks.append(item)
+    return bookmarks
+
+
+def prune_stale_bookmarks(
+    feed_specs: list[FeedSpec],
+    username: str,
+    password: str,
+    consumer_key: str,
+    consumer_secret: str,
+    dry_run: bool = False,
+    sleep_seconds: float = 1.0,
+) -> int:
+    """Find and delete bookmarks in Instapaper older than max_age_days for matching feeds."""
+    prune_feeds = [f for f in feed_specs if f.max_age_days is not None]
+    if not prune_feeds:
+        return 0
+
+    if not consumer_key or not consumer_secret:
+        print(
+            "Notice: Staleness pruning configured in feeds.txt, but CONSUMER_KEY and CONSUMER_SECRET "
+            "are not set. Skipping pruning.",
+            file=sys.stderr,
+        )
+        return 0
+
+    if not username:
+        print("Notice: INSTAPAPER_USERNAME not set; skipping pruning.", file=sys.stderr)
+        return 0
+
+    print(f"Checking staleness pruning for {len(prune_feeds)} feed(s)...")
+    try:
+        session = get_instapaper_oauth_session(username, password, consumer_key, consumer_secret)
+        bookmarks = fetch_bookmarks(session)
+    except Exception as e:
+        print(f"Error during Instapaper pruning: {e}", file=sys.stderr)
+        return 0
+
+    now = time.time()
+    deleted_count = 0
+    deleted_ids: set[Any] = set()
+
+    for feed in prune_feeds:
+        max_days = feed.max_age_days
+        assert max_days is not None
+        cutoff_timestamp = now - (max_days * 86400)
+
+        for bm in bookmarks:
+            bm_id = bm.get("bookmark_id") or bm.get("id")
+            bm_url = bm.get("url", "")
+            bm_time = bm.get("time", 0)
+
+            if not bm_id or not bm_url or bm_id in deleted_ids:
+                continue
+
+            if bookmark_matches_feed(bm_url, feed.url):
+                if bm_time < cutoff_timestamp:
+                    age_days = (now - bm_time) / 86400
+                    if dry_run:
+                        print(
+                            f"would prune: {bm_url} (id={bm_id}, age={age_days:.1f}d > {max_days}d)"
+                        )
+                        deleted_count += 1
+                        deleted_ids.add(bm_id)
+                    else:
+                        del_resp = session.post(
+                            INSTAPAPER_BOOKMARKS_DELETE_URL,
+                            data={"bookmark_id": bm_id},
+                            timeout=60,
+                        )
+                        if del_resp.status_code == 200:
+                            print(
+                                f"pruned ({del_resp.status_code}): {bm_url} (age={age_days:.1f}d > {max_days}d)"
+                            )
+                            deleted_count += 1
+                            deleted_ids.add(bm_id)
+                        else:
+                            print(
+                                f"Failed to prune {bm_url} (id={bm_id}, status={del_resp.status_code}): "
+                                f"{del_resp.text.strip()[:200]}",
+                                file=sys.stderr,
+                            )
+                        if sleep_seconds > 0:
+                            time.sleep(sleep_seconds)
+
+    return deleted_count
+
+
+def parse_feed_spec_line(line: str) -> FeedSpec:
     """
     One feed spec per line after comment stripping:
       URL
-      URL <positive int M>   → only consider the first M entries from the fetched feed
-        (feedparser order is usually newest-first, so this is the M newest items in the XML).
-        Items beyond that window are ignored, including across future runs, until they re-enter
-        the window. Omit M to consider the full entry list returned by the feed.
+      URL <positive int M>
+      URL <positive int M> <positive int staleness_days>
+      URL - <positive int staleness_days>
+      URL 0 <positive int staleness_days>
     """
     parts = line.split()
     if not parts:
         raise ValueError("empty feed line")
+
+    # Check for 3+ parts: URL [M] [staleness_days]
+    if len(parts) >= 3:
+        last_tok = parts[-1]
+        second_last_tok = parts[-2]
+        if last_tok.isdigit():
+            days = int(last_tok, 10)
+            if days < 1:
+                raise ValueError(f"staleness days must be >= 1, got {days}")
+            if second_last_tok.isdigit():
+                m_val = int(second_last_tok, 10)
+                m = m_val if m_val >= 1 else None
+                url = " ".join(parts[:-2]).strip()
+                if not url:
+                    raise ValueError("missing URL")
+                return FeedSpec(url=url, depth_m=m, max_age_days=days)
+            elif second_last_tok in ("-", "0", "none", "None", "all"):
+                url = " ".join(parts[:-2]).strip()
+                if not url:
+                    raise ValueError("missing URL")
+                return FeedSpec(url=url, depth_m=None, max_age_days=days)
+
+    # Check for 2+ parts: URL [M]
     if len(parts) >= 2 and parts[-1].isdigit():
         depth = int(parts[-1], 10)
         if depth < 1:
@@ -152,14 +370,15 @@ def parse_feed_spec_line(line: str) -> tuple[str, int | None]:
         url = " ".join(parts[:-1]).strip()
         if not url:
             raise ValueError("missing URL before feed depth M")
-        return url, depth
-    return " ".join(parts).strip(), None
+        return FeedSpec(url=url, depth_m=depth, max_age_days=None)
+
+    return FeedSpec(url=" ".join(parts).strip(), depth_m=None, max_age_days=None)
 
 
-def load_feed_specs_from_file(path: Path) -> list[tuple[str, int | None]]:
+def load_feed_specs_from_file(path: Path) -> list[FeedSpec]:
     """One feed spec per line; # starts a comment to end of line; blank lines skipped."""
     text = path.read_text(encoding="utf-8")
-    specs: list[tuple[str, int | None]] = []
+    specs: list[FeedSpec] = []
     for lineno, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -169,21 +388,25 @@ def load_feed_specs_from_file(path: Path) -> list[tuple[str, int | None]]:
         if not line:
             continue
         try:
-            url, cap = parse_feed_spec_line(line)
+            spec = parse_feed_spec_line(line)
         except ValueError as e:
             raise ValueError(f"{path}:{lineno}: {e}") from e
-        if url:
-            specs.append((url, cap))
+        if spec.url:
+            specs.append(spec)
     return specs
 
 
 def resolve_feed_specs(
     feeds_file: Path | None,
     extra_feeds: list[str] | None,
-) -> tuple[list[tuple[str, int | None]], str]:
+) -> tuple[list[FeedSpec], str]:
     """Returns (feed specs, description of source for messages)."""
     script_feeds_txt = script_dir() / "feeds.txt"
-    extras_specs = [(u.strip(), None) for u in (extra_feeds or []) if u.strip()]
+    extras_specs = [
+        FeedSpec(url=u.strip(), depth_m=None, max_age_days=None)
+        for u in (extra_feeds or [])
+        if u.strip()
+    ]
 
     if feeds_file is not None:
         path = feeds_file.expanduser().resolve()
@@ -208,20 +431,20 @@ def resolve_feed_specs(
     return list(DEFAULT_FEED_SPECS), "built-in default"
 
 
-def _dedupe_specs_preserve_order(specs: list[tuple[str, int | None]]) -> list[tuple[str, int | None]]:
+def _dedupe_specs_preserve_order(specs: list[FeedSpec]) -> list[FeedSpec]:
     seen_u: set[str] = set()
-    out: list[tuple[str, int | None]] = []
-    for url, cap in specs:
-        u = url.strip()
+    out: list[FeedSpec] = []
+    for spec in specs:
+        u = spec.url.strip()
         if not u or u in seen_u:
             continue
         seen_u.add(u)
-        out.append((u, cap))
+        out.append(spec)
     return out
 
 
 def collect_new_items(
-    feed_specs: list[tuple[str, int | None]],
+    feed_specs: list[FeedSpec],
     already_seen: set[str],
 ) -> list[tuple[str, str, str | None]]:
     """Scan all feeds; return (fingerprint, article_url, title) not yet seen (deduped within this run).
@@ -232,7 +455,9 @@ def collect_new_items(
     pending_fp: set[str] = set()
     to_send: list[tuple[str, str, str | None]] = []
 
-    for feed_url, entry_depth_m in feed_specs:
+    for spec in feed_specs:
+        feed_url = spec.url
+        entry_depth_m = spec.depth_m
         parsed = feedparser.parse(feed_url)
         if getattr(parsed, "bozo", False) and not parsed.entries:
             print(
@@ -265,8 +490,10 @@ def parse_args() -> argparse.Namespace:
         "--feeds-file",
         type=Path,
         default=None,
-        help="Feeds file: one URL per line, optional trailing depth M: \"URL\" or \"URL M\". "
+        help="Feeds file: one URL per line, optional trailing depth M and staleness days: "
+        "\"URL\", \"URL M\", or \"URL M days\". "
         "M = only consider the first M entries from that feed's XML (usually the M newest). "
+        "days = prune unread Instapaper bookmarks from that source older than days. "
         "# comments allowed. "
         f"If omitted, uses {script_dir() / 'feeds.txt'} when that file exists, else built-in defaults.",
     )
@@ -287,6 +514,11 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Parse feed and print actions only; do not call Instapaper or update state",
+    )
+    p.add_argument(
+        "--skip-prune",
+        action="store_true",
+        help="Skip staleness pruning even if staleness days is specified in feeds.txt",
     )
     p.add_argument(
         "--max-add",
@@ -312,8 +544,16 @@ def main() -> int:
     state_path = args.state_file or default_state_path()
     seen = load_seen(state_path) if not args.dry_run else set()
 
-    user = os.environ.get("INSTAPAPER_USERNAME", "").strip()
-    password = os.environ.get("INSTAPAPER_PASSWORD", "")
+    user = os.environ.get("INSTAPAPER_USERNAME", "").strip() or os.environ.get("username", "").strip()
+    password = os.environ.get("INSTAPAPER_PASSWORD", "") or os.environ.get("password", "")
+    consumer_key = (
+        os.environ.get("CONSUMER_KEY", "").strip()
+        or os.environ.get("INSTAPAPER_CONSUMER_KEY", "").strip()
+    )
+    consumer_secret = (
+        os.environ.get("CONSUMER_SECRET", "").strip()
+        or os.environ.get("INSTAPAPER_CONSUMER_SECRET", "").strip()
+    )
 
     if not args.dry_run and not user:
         print("INSTAPAPER_USERNAME is required (or use --dry-run).", file=sys.stderr)
@@ -330,13 +570,25 @@ def main() -> int:
 
     print(f"Feeds ({len(feed_specs)}): from {source_label}")
 
+    pruned = 0
+    if not args.skip_prune:
+        pruned = prune_stale_bookmarks(
+            feed_specs=feed_specs,
+            username=user,
+            password=password,
+            consumer_key=consumer_key,
+            consumer_secret=consumer_secret,
+            dry_run=args.dry_run,
+            sleep_seconds=args.sleep_seconds,
+        )
+
     to_send = collect_new_items(feed_specs, seen)
 
     if args.max_add > 0:
         to_send = to_send[: args.max_add]
 
     if not to_send:
-        print("No new items.")
+        print(f"No new items to add. Pruned {pruned} item(s).")
         return 0
 
     session = requests.Session()
@@ -371,9 +623,9 @@ def main() -> int:
             time.sleep(args.sleep_seconds)
 
     if args.dry_run:
-        print(f"--dry-run: {len(to_send)} new item(s) would be sent.")
+        print(f"--dry-run: {len(to_send)} new item(s) would be sent, {pruned} item(s) would be pruned.")
     else:
-        print(f"Done. Added {added} item(s).")
+        print(f"Done. Added {added} item(s), pruned {pruned} item(s).")
     return 0
 
 

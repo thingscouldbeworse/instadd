@@ -1,14 +1,23 @@
 # One RSS or Atom feed URL per line. Lines starting with # are ignored.
 # Inline comments: text after the first # on a line is ignored (avoid # in URLs).
 #
+# Format:
+#   URL [M] [staleness_days]
+#
 # Optional depth M after the URL: only the first M entries from the fetched feed XML are
 # considered (feed order is usually newest-first, so this is the M newest posts in the file).
 # Older items outside that window are never sent unless they re-enter the top M. Use this so a
 # huge feed cannot be drained across many cron runs; global per-run Instapaper cap is --limit N.
 #
+# Optional staleness_days after M: maximum days to keep unread articles from this feed.
+# Articles in your Instapaper account older than staleness_days will be pruned/deleted.
+# Omit or set to - / 0 for no pruning. To set staleness without depth M, use "-" or "0" for M.
+#
 # Examples:
-#   https://example.com/feed/
-#   https://example.com/other/feed/ 25
+#   https://example.com/feed/            # No depth cap, no pruning
+#   https://example.com/other/feed/ 25   # Depth cap 25, no pruning
+#   https://example.com/daily/feed/ 30 7 # Depth cap 30, prune items older than 7 days
+#   https://example.com/news/feed/ - 14  # No depth cap, prune items older than 14 days
 
 https://theintercept.com/feed/ 30
 https://exple.tive.org/blarg/feed/ 20
